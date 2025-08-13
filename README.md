@@ -251,13 +251,3 @@ License
 
 MIT — feel free to use, modify, and share. Add a LICENSE file in your repo with the MIT text.
 How to keep it “beautiful” on GitHub
-
-    Keep headings to # → ### depth; avoid going deeper than ####.
-
-    Use tables for ports/flags and code fences for commands.
-
-    Use badges (shields.io) at the top for quick status.
-
-    Use <details><summary> for long troubleshooting sections.
-
-    Keep lines ≤ 100 chars where possible for readability in raw view.
