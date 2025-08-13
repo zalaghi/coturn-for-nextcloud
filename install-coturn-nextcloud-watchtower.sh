@@ -1,16 +1,35 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# 0) Root & prereqs
+# ──────────────────────────── About this script ───────────────────────────────
+# Multi-server ready:
+#   • Per-server FQDN (DOMAIN prompt) + global REALM (same across all nodes)
+#   • Shared SECRET supported via env: SECRET="<hex32|hex64>"  (or auto-generate on 1st node)
+#   • Always binds :443 on nginx (TCP passthrough) → coturn TLS on :5349 (PUBLIC_IP)
+# Works on: Debian 11/12, Ubuntu 20.04/22.04/24.04 (systemd + apt)
+#
+# First node (creates SECRET):
+#   sudo REALM="talk.example.com" bash install-coturn-nextcloud-watchtower.sh
+# Next nodes (reuse SECRET):
+#   sudo REALM="talk.example.com" SECRET="<same-secret>" bash install-coturn-nextcloud-watchtower.sh
+#
+# Optional flags:
+#   RESET=1        rotate/override SECRET (if not supplied via env)
+#   PULL_NOW=1     docker pull latest images immediately
+#   FORCE_RENEW=1  force LE renewal now
+#   WATCH_SCHED="0 0 4 * * 0"  change Watchtower schedule (cron with seconds)
+
+# ───────────────────────── 0) Root & prerequisites ───────────────────────────
 if [[ $EUID -ne 0 ]]; then echo "Run as root: sudo bash $0"; exit 1; fi
 export DEBIAN_FRONTEND=noninteractive
+
 apt-get update -y
 apt-get install -y curl ca-certificates dnsutils jq openssl
 
 # Docker
 command -v docker >/dev/null 2>&1 || { apt-get install -y docker.io; systemctl enable --now docker; }
 
-# nginx + stream module
+# nginx + stream (TCP) module
 command -v nginx  >/dev/null 2>&1 || { apt-get install -y nginx;     systemctl enable --now nginx; }
 apt-get install -y libnginx-mod-stream
 [ -f /etc/nginx/modules-enabled/50-mod-stream.conf ] || \
@@ -19,7 +38,7 @@ apt-get install -y libnginx-mod-stream
 # Certbot
 command -v certbot >/dev/null 2>&1 || apt-get install -y certbot
 
-# AppArmor
+# AppArmor self-heal (fallback to unconfined if unavailable)
 apt-get install -y apparmor apparmor-utils || true
 systemctl enable --now apparmor || true
 APPARMOR_OPT=""
@@ -29,28 +48,36 @@ else
   APPARMOR_OPT="--security-opt apparmor=unconfined"
 fi
 
-# 1) Inputs & toggles
-read -rp "TURN domain (e.g. talk.example.com): " DOMAIN
+# ───────────────────────── 1) Inputs & toggles ───────────────────────────────
+read -rp "TURN server FQDN for THIS node (e.g. turn-de.example.com): " DOMAIN
 [[ -z "${DOMAIN}" ]] && { echo "Domain cannot be empty"; exit 1; }
+
+# Global realm (identical on every node). Preseed via REALM env or enter here.
+DEFAULT_REALM="${REALM:-talk.example.com}"
+read -rp "TURN realm (same across ALL nodes) [${DEFAULT_REALM}]: " REALM_INPUT
+REALM="${REALM_INPUT:-$DEFAULT_REALM}"
+[[ -z "${REALM}" ]] && { echo "Realm cannot be empty"; exit 1; }
+
 read -rp "Admin email for Let's Encrypt: " EMAIL
 [[ -z "${EMAIL}" ]] && { echo "Email cannot be empty"; exit 1; }
 
 MINP="${MINP:-50000}"
 MAXP="${MAXP:-50020}"
-WATCH_SCHED="${WATCH_SCHED:-0 0 4 * * 0}"  # Sun 04:00 (cron with seconds)
+WATCH_SCHED="${WATCH_SCHED:-0 0 4 * * 0}"   # Sun 04:00 local (cron with seconds)
 TZ_STR="$(cat /etc/timezone 2>/dev/null || echo UTC)"
-RESET="${RESET:-0}"         # rotate TURN secret if 1
-PULL_NOW="${PULL_NOW:-0}"   # docker pull latest if 1
-FORCE_RENEW="${FORCE_RENEW:-0}" # force LE renewal if 1
+RESET="${RESET:-0}"
+PULL_NOW="${PULL_NOW:-0}"
+FORCE_RENEW="${FORCE_RENEW:-0}"
 
-# 2) DNS sanity
+# ───────────────────────── 2) DNS sanity ─────────────────────────────────────
 PUBIP4="$(curl -4 -s https://api.ipify.org || true)"
 DNSV4="$(dig +short A "${DOMAIN}" | tail -n1 || true)"
 if [[ -z "${PUBIP4}" || -z "${DNSV4}" || "${PUBIP4}" != "${DNSV4}" ]]; then
   echo "❌ DNS for ${DOMAIN} must point to ${PUBIP4}. Fix DNS and re-run."; exit 1
 fi
+echo "✅ DNS OK (${DOMAIN} → ${DNSV4})"
 
-# 3) nginx webroot on :80
+# ───────────────────────── 3) Nginx webroot on :80 ───────────────────────────
 WEBROOT="/var/www/certbot"; mkdir -p "${WEBROOT}"; chown -R www-data:www-data "${WEBROOT}"
 ACME_SITE="/etc/nginx/sites-available/certbot-${DOMAIN}.conf"
 cat > "${ACME_SITE}" <<EOF
@@ -67,35 +94,42 @@ ln -sf "${ACME_SITE}" "/etc/nginx/sites-enabled/certbot-${DOMAIN}.conf"
 [[ -e /etc/nginx/sites-enabled/default ]] && rm -f /etc/nginx/sites-enabled/default
 nginx -t && systemctl reload nginx
 
-# 4) Get/renew cert
+# ───────────────────────── 4) Get/renew cert ─────────────────────────────────
 certbot certonly --webroot -w "${WEBROOT}" -d "${DOMAIN}" \
   --agree-tos -m "${EMAIL}" --non-interactive --no-eff-email
 CERT_DIR="/etc/letsencrypt/live/${DOMAIN}"
-[[ -s "${CERT_DIR}/fullchain.pem" && -s "${CERT_DIR}/privkey.pem" ]] || { echo "❌ Cert failed"; exit 1; }
+CERT="${CERT_DIR}/fullchain.pem"; KEY="${CERT_DIR}/privkey.pem"
+[[ -s "${CERT}" && -s "${KEY}" ]] || { echo "❌ Cert failed"; exit 1; }
 [[ "${FORCE_RENEW}" = "1" ]] && certbot renew --force-renewal || true
 
-# 5) coturn config (no listening-ip lines)
+# ───────────────────────── 5) coturn config (REALM + shared SECRET) ──────────
 INSTALL_DIR="/opt/coturn"; LOG_DIR="${INSTALL_DIR}/log"; mkdir -p "${INSTALL_DIR}" "${LOG_DIR}"
-if [[ "${RESET}" = "1" ]] || ! grep -q 'static-auth-secret=' "${INSTALL_DIR}/turnserver.conf" 2>/dev/null; then
-  SECRET="$(openssl rand -hex 32)"
+
+# SECRET precedence: env SECRET > existing config > generate new (unless RESET=1)
+if [[ -n "${SECRET:-}" ]]; then
+  SHARED_SECRET="${SECRET}"
+elif grep -q 'static-auth-secret=' "${INSTALL_DIR}/turnserver.conf" 2>/dev/null && [[ "${RESET}" != "1" ]]; then
+  SHARED_SECRET="$(grep -m1 'static-auth-secret=' "${INSTALL_DIR}/turnserver.conf" | cut -d= -f2)"
 else
-  SECRET="$(grep -m1 'static-auth-secret=' "${INSTALL_DIR}/turnserver.conf" | cut -d= -f2)"
+  SHARED_SECRET="$(openssl rand -hex 32)"
 fi
+
+# Clean any stale lines from previous runs
 sed -i '/^alt-tls-listening-port=/d' "${INSTALL_DIR}/turnserver.conf" 2>/dev/null || true
-sed -i '/^lt-cred-mech$/d' "${INSTALL_DIR}/turnserver.conf" 2>/dev/null || true
-sed -i '/^listening-ip=/d' "${INSTALL_DIR}/turnserver.conf" 2>/dev/null || true
+sed -i '/^lt-cred-mech$/d'            "${INSTALL_DIR}/turnserver.conf" 2>/dev/null || true
+sed -i '/^listening-ip=/d'            "${INSTALL_DIR}/turnserver.conf" 2>/dev/null || true
 
 cat > "${INSTALL_DIR}/turnserver.conf" <<EOF
-# === coturn for Nextcloud Talk (shared-secret) ===
+# === coturn for Nextcloud Talk (shared-secret; multi-node ready) ===
 listening-port=3478
 tls-listening-port=5349
 
 external-ip=${PUBIP4}
-realm=${DOMAIN}
+realm=${REALM}
 server-name=${DOMAIN}
 
 use-auth-secret
-static-auth-secret=${SECRET}
+static-auth-secret=${SHARED_SECRET}
 stale-nonce
 fingerprint
 
@@ -105,7 +139,7 @@ pkey=/etc/letsencrypt/live/${DOMAIN}/privkey.pem
 min-port=${MINP}
 max-port=${MAXP}
 
-# These may log as "Bad configuration format" on some builds; harmless. Remove if noisy:
+# These may warn as "Bad configuration format" on some builds; harmless:
 no-loopback-peers
 no-multicast-peers
 
@@ -115,8 +149,9 @@ cli-password=$(openssl rand -hex 12)
 EOF
 chmod 600 "${INSTALL_DIR}/turnserver.conf"
 
-# 6) (Re)deploy coturn
+# ───────────────────────── 6) (Re)deploy coturn ──────────────────────────────
 [[ "${PULL_NOW}" = "1" ]] && { docker pull coturn/coturn:latest || true; docker pull containrrr/watchtower:latest || true; }
+
 docker rm -f coturn >/dev/null 2>&1 || true
 docker run -d --name coturn \
   --restart unless-stopped \
@@ -131,7 +166,7 @@ docker run -d --name coturn \
 sleep 2
 docker ps --format 'table {{.Names}}\t{{.Status}}' | grep -q '^coturn' || { echo "❌ coturn failed"; docker logs coturn || true; exit 1; }
 
-# 7) nginx TCP stream — ALWAYS bind 443 and proxy to PUBLIC_IP:5349
+# ───────────────────────── 7) nginx TCP stream — ALWAYS bind :443 ────────────
 mkdir -p /etc/nginx/streams-enabled
 cat > /etc/nginx/streams-enabled/turn-443.conf <<EOF
 server {
@@ -146,7 +181,7 @@ if ! grep -q 'streams-enabled/\*\.conf' /etc/nginx/nginx.conf; then
 fi
 nginx -t && systemctl reload nginx
 
-# 8) Open firewall (UFW if present)
+# ───────────────────────── 8) Open firewall (if UFW present) ─────────────────
 if command -v ufw >/dev/null 2>&1; then
   ufw allow 80/tcp || true
   ufw allow 443/tcp || true
@@ -156,7 +191,7 @@ if command -v ufw >/dev/null 2>&1; then
   ufw allow ${MINP}:${MAXP}/udp || true
 fi
 
-# 9) Certbot deploy hook
+# ───────────────────────── 9) Certbot deploy hook ────────────────────────────
 HOOK="/etc/letsencrypt/renewal-hooks/deploy/restart-coturn.sh"
 mkdir -p "$(dirname "${HOOK}")"
 cat > "${HOOK}" <<'HOK'
@@ -169,7 +204,7 @@ fi
 HOK
 chmod +x "${HOOK}"
 
-# 10) Watchtower weekly updates
+# ───────────────────────── 10) Watchtower weekly updates ─────────────────────
 docker rm -f watchtower >/dev/null 2>&1 || true
 docker run -d --name watchtower \
   --restart unless-stopped \
@@ -180,21 +215,24 @@ docker run -d --name watchtower \
   --label "com.centurylinklabs.watchtower.enable=true" \
   containrrr/watchtower:latest --label-enable coturn watchtower
 
-# 11) Helper
+# ───────────────────────── 11) Helper tool ───────────────────────────────────
 cat > /usr/local/bin/turnctl <<'EOS'
 #!/usr/bin/env bash
 set -euo pipefail
 CONF="/opt/coturn/turnserver.conf"
-DOMAIN="$(grep -m1 '^realm=' "$CONF" | cut -d= -f2)"
+REALM="$(grep -m1 '^realm=' "$CONF" | cut -d= -f2)"
+DOMAIN="$(grep -m1 '^server-name=' "$CONF" | cut -d= -f2)"
 SECRET="$(grep -m1 '^static-auth-secret=' "$CONF" | cut -d= -f2)"
 PUBIP4="$(curl -4 -s https://api.ipify.org || true)"
 case "${1:-}" in
   creds)
     USER=$(($(date +%s)+3600))
     PASS=$(printf "%s" "$USER" | openssl dgst -sha1 -mac HMAC -macopt hexkey:${SECRET} -binary | base64)
-    echo "Username:  $USER"; echo "Password:  $PASS" ;;
+    echo "Realm:     $REALM"
+    echo "Username:  $USER"
+    echo "Password:  $PASS" ;;
   status)
-    echo "TURN host: $DOMAIN  (IP: ${PUBIP4})"
+    echo "TURN host: $DOMAIN   Realm: $REALM   IP: ${PUBIP4}"
     ss -ltnup '( sport = :3478 or sport = :5349 or sport = :443 )' || true ;;
   tls)    openssl s_client -connect "${DOMAIN}:5349" -servername "${DOMAIN}" -tls1_2 -brief </dev/null || true ;;
   tls443) openssl s_client -connect "${DOMAIN}:443"  -servername "${DOMAIN}" -tls1_2 -brief </dev/null || true ;;
@@ -203,38 +241,38 @@ esac
 EOS
 chmod +x /usr/local/bin/turnctl
 
-# 12) Final output
+# ───────────────────────── 12) Final output ──────────────────────────────────
 USER_VAL=$(($(date +%s)+3600))
-PASS_VAL=$(printf "%s" "$USER_VAL" | openssl dgst -sha1 -mac HMAC -macopt hexkey:${SECRET} -binary | base64)
+PASS_VAL=$(printf "%s" "$USER_VAL" | openssl dgst -sha1 -mac HMAC -macopt hexkey:${SHARED_SECRET} -binary | base64)
+
 cat <<EOT
 
 ===============================================================================
- ✅ TURN ready — 3478/udp+tcp, 5349/tcp, 443/tcp (nginx → ${PUBIP4}:5349)
+ ✅ TURN ready (multi-node): 3478/udp+tcp, 5349/tcp, 443/tcp (nginx → ${PUBIP4}:5349)
 ===============================================================================
-TURN host:            ${DOMAIN}
-Public IPv4:          ${PUBIP4}
-TURN shared secret:   ${SECRET}
+This node (FQDN):   ${DOMAIN}
+TURN Realm:         ${REALM}   (use this REALM on ALL servers)
+TURN shared secret: ${SHARED_SECRET}
 
 Nextcloud → Settings → Administration → Talk
   STUN:
     stun:${DOMAIN}:3478
-  TURN (add all):
+  TURN (add all for EACH server you deploy):
     turn:${DOMAIN}:3478?transport=udp
     turn:${DOMAIN}:3478?transport=tcp
     turns:${DOMAIN}:5349?transport=tcp
     turns:${DOMAIN}:443?transport=tcp
 
+Add additional servers with their own FQDNs but the SAME realm & secret:
+  sudo REALM="${REALM}" SECRET="${SHARED_SECRET}" bash install-coturn-nextcloud-watchtower.sh
+
 Helper:   turnctl creds | turnctl status | turnctl tls | turnctl tls443
 Config:   /opt/coturn/turnserver.conf
 Logs:     /opt/coturn/log/turn.log
-
-Watchtower:
-  Schedule: ${WATCH_SCHED} (Sun 04:00 default)   TZ: ${TZ_STR}
+Watchtower schedule: ${WATCH_SCHED}  (TZ: ${TZ_STR})
 
 Notes:
-  • Cloudflare DNS → **DNS only** (grey cloud).
+  • If using Cloudflare, set each TURN A/AAAA record to DNS-only (grey cloud).
   • Cloud firewall must allow: 80/tcp, 443/tcp, 3478/udp+tcp, 5349/tcp, ${MINP}-${MAXP}/udp.
-  • Re-run anytime to reinstall/update. Optional flags:
-      RESET=1  PULL_NOW=1  FORCE_RENEW=1
 ===============================================================================
 EOT
