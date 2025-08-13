@@ -20,23 +20,6 @@ A one-command installer that deploys a **TURN** server for **Nextcloud Talk**:
 
 ---
 
-## Table of Contents
-- [Supported OS](#supported-os)
-- [What the Installer Does](#what-the-installer-does)
-- [Ports](#ports)
-- [Quick Start](#quick-start)
-- [Environment Flags](#environment-flags)
-- [Configure Nextcloud Talk](#configure-nextcloud-talk)
-- [Performance & Behavior (turn vs turns)](#performance--behavior-turn-vs-turns)
-- [Security Notes](#security-notes)
-- [Files & Locations](#files--locations)
-- [Helper Commands](#helper-commands)
-- [Troubleshooting](#troubleshooting)
-- [Uninstall](#uninstall)
-- [License](#license)
-
----
-
 ## Supported OS
 - **Debian** 11 / 12  
 - **Ubuntu** 20.04 / 22.04 / 24.04  
@@ -48,8 +31,8 @@ A one-command installer that deploys a **TURN** server for **Nextcloud Talk**:
 
 ## What the Installer Does
 1. Installs **Docker**, **Nginx** (+ **libnginx-mod-stream**), **Certbot**, and utilities.  
-2. Provisions a Let’s Encrypt cert for your **TURN domain** using **Nginx webroot** on port **80**.  
-3. Writes a hardened **coturn** config with **shared secret** and a small **UDP relay** range.  
+2. Provisions a Let’s Encrypt cert for your **TURN server FQDN** using **Nginx webroot** on port **80**.  
+3. Writes a hardened **coturn** config with a global **REALM** and shared-secret auth.  
 4. Runs **coturn** (Docker) with **host networking** and **root** to read LE certs.  
 5. Binds **Nginx :443** and **TCP-proxies** to **`PUBLIC_IP:5349`** (coturn’s TLS).  
 6. Installs a **cert deploy hook** that restarts coturn after each renewal.  
@@ -68,7 +51,7 @@ A one-command installer that deploys a **TURN** server for **Nextcloud Talk**:
 | **5349/TCP** | TURN over TLS (coturn terminates TLS) |
 | **50,000–50,020/UDP** | TURN media relays (configurable via `MINP/MAXP`) |
 
-> Open these in your cloud firewall. If using Cloudflare DNS, set your TURN record to **DNS only** (grey cloud).
+> Open these in your cloud firewall. If using Cloudflare DNS, set your TURN records to **DNS only** (grey cloud).
 
 ---
 
@@ -79,13 +62,21 @@ A one-command installer that deploys a **TURN** server for **Nextcloud Talk**:
 install-coturn-nextcloud-watchtower.sh
 ```
 
-2. Run it:
+2. Run it on each server:
 ```bash
-sudo bash install-coturn-nextcloud-watchtower.sh
-```
-You’ll be asked for your **TURN domain** (e.g., `talk.example.com`) and **email** for Let’s Encrypt.
+# First node (creates the REALM & SECRET if not supplied)
+sudo REALM="talk.example.com" bash install-coturn-nextcloud-watchtower.sh
 
-3. At the end, the script prints your **TURN shared secret** and test credentials.
+# Additional nodes (reuse the same SECRET printed by the first node)
+sudo REALM="talk.example.com" SECRET="<same-secret>" bash install-coturn-nextcloud-watchtower.sh
+```
+
+The script prompts for:
+- **TURN server FQDN** for *this node* (e.g., `turn-de.example.com`)
+- **Realm** (defaults to `talk.example.com`; must be **identical on all nodes**)
+- **Email** for Let’s Encrypt
+
+At the end, it prints your **shared SECRET** and test credentials.
 
 ---
 
@@ -95,6 +86,8 @@ Set these before running the installer to customize behavior.
 
 | Variable | Default | Description |
 |---|---:|---|
+| `REALM` | `talk.example.com` | Global realm string (same on all nodes) |
+| `SECRET` | *(auto)* | Shared secret (hex). Provide to reuse across nodes. |
 | `MINP` | `50000` | Start of UDP relay port range |
 | `MAXP` | `50020` | End of UDP relay port range |
 | `WATCH_SCHED` | `0 0 4 * * 0` | Watchtower cron (with **seconds**), Sun 04:00 local |
@@ -104,7 +97,8 @@ Set these before running the installer to customize behavior.
 
 Example:
 ```bash
-sudo RESET=1 PULL_NOW=1 WATCH_SCHED="0 15 3 * * 0" bash install-coturn-nextcloud-watchtower.sh
+sudo REALM="talk.example.com" RESET=1 PULL_NOW=1 WATCH_SCHED="0 15 3 * * 0" \
+  bash install-coturn-nextcloud-watchtower.sh
 ```
 
 ---
@@ -113,18 +107,21 @@ sudo RESET=1 PULL_NOW=1 WATCH_SCHED="0 15 3 * * 0" bash install-coturn-nextcloud
 
 **Settings → Administration → Talk → STUN/TURN servers**
 
+For **each server** you deploy (e.g., `turn-de.example.com`, `turn-es.example.com`), add:
+
 ```text
 STUN
-  stun:<your-domain>:3478
+  stun:<server-fqdn>:3478
 
-TURN (add all)
-  turn:<your-domain>:3478?transport=udp
-  turn:<your-domain>:3478?transport=tcp
-  turns:<your-domain>:5349?transport=tcp
-  turns:<your-domain>:443?transport=tcp
+TURN
+  turn:<server-fqdn>:3478?transport=udp
+  turn:<server-fqdn>:3478?transport=tcp
+  turns:<server-fqdn>:5349?transport=tcp
+  turns:<server-fqdn>:443?transport=tcp
 ```
 
-**TURN secret**: paste the value printed by the installer.
+**TURN secret**: paste the **shared SECRET** (same for all servers; one field in Nextcloud).  
+Nextcloud does not have a realm field — only the secret.
 
 > Browsers automatically test all paths (ICE) and pick the **fastest working** one.
 
@@ -146,16 +143,19 @@ TURN (add all)
   🧱 Works through most corporate/ISP firewalls that only allow HTTPS.  
   Nginx forwards raw TCP → coturn’s TLS at **5349**; TLS still terminates at **coturn**.
 
-**Recommendation:** add **all four** entries. ICE chooses the fastest path automatically.
+**Recommendation:** add **all four** entries per server. ICE chooses the fastest path automatically.
 
 ---
 
-## Security Notes
+## Multi-server Notes (same REALM & SECRET)
 
-- WebRTC voice/video is encrypted **end-to-end** with **DTLS-SRTP**.  
-  Even when relayed through TURN, your server **cannot decrypt** media.
-- Using `turns:` encrypts the **TURN control channel** (credentials + metadata) with TLS.
-- For Cloudflare DNS, the TURN record must be **DNS only** (no orange proxy).
+- Use **one global REALM** (e.g., `talk.example.com`) on all TURN servers.  
+- Reuse the **same `SECRET`** across nodes (supply `SECRET="..."` env when running the script).  
+- Each server should have its **own FQDN** and cert (e.g., `turn-de.example.com`, `turn-es.example.com`).  
+- The realm string itself does **not** need DNS or a cert unless you also use it as a TURN endpoint.
+
+**DNS patterns:** We recommend `turn-<region>.example.com` (easy certificates; wildcard-friendly).  
+If you prefer one hostname with multiple A/AAAA records, use DNS with **health checks/latency routing** and prefer **DNS-01** for certificates.
 
 ---
 
@@ -163,7 +163,7 @@ TURN (add all)
 
 - **Config:** `/opt/coturn/turnserver.conf`  
 - **Logs:** `/opt/coturn/log/turn.log`  
-- **Certs:** `/etc/letsencrypt/live/<domain>/{fullchain.pem,privkey.pem}`  
+- **Certs:** `/etc/letsencrypt/live/<server-fqdn>/{fullchain.pem,privkey.pem}`  
 - **Nginx stream:** `/etc/nginx/streams-enabled/turn-443.conf`  
 - **Cert hook:** `/etc/letsencrypt/renewal-hooks/deploy/restart-coturn.sh`  
 - **Helper:** `/usr/local/bin/turnctl`
@@ -180,8 +180,8 @@ turnctl status
 turnctl creds
 
 # TLS checks
-turnctl tls       # tests <domain>:5349
-turnctl tls443    # tests <domain>:443 (via nginx passthrough)
+turnctl tls       # tests <server-fqdn>:5349
+turnctl tls443    # tests <server-fqdn>:443 (via nginx passthrough)
 ```
 
 Low-level checks:
@@ -210,7 +210,7 @@ docker logs --tail=200 coturn # coturn logs
    nginx -t && systemctl reload nginx
    ss -ltnp | grep ':443'
    ```
-3. Cloud firewall must allow **443/TCP**. Cloudflare DNS: **DNS only** for the record.
+3. Cloud firewall must allow **443/TCP**. Cloudflare DNS: **DNS only** for each TURN record.
 </details>
 
 <details>
@@ -227,7 +227,7 @@ Open these in your cloud firewall/security group:
 <summary><b>Rotate the TURN secret</b></summary>
 
 ```bash
-sudo RESET=1 bash install-coturn-nextcloud-watchtower.sh
+sudo REALM="talk.example.com" RESET=1 bash install-coturn-nextcloud-watchtower.sh
 ```
 Then update the new secret in **Nextcloud → Talk**.
 </details>
