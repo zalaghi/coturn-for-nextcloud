@@ -62,7 +62,7 @@ read -rp "Admin email for Let's Encrypt: " EMAIL
 [[ -z "${EMAIL}" ]] && { echo "Email cannot be empty"; exit 1; }
 
 MINP="${MINP:-50000}"
-MAXP="${MAXP:-50020}"
+MAXP="${MAXP:-50100}"
 WATCH_SCHED="${WATCH_SCHED:-0 0 4 * * 0}"   # Sun 04:00 local (cron with seconds)
 TZ_STR="$(cat /etc/timezone 2>/dev/null || echo UTC)"
 RESET="${RESET:-0}"
@@ -114,10 +114,11 @@ else
   SHARED_SECRET="$(openssl rand -hex 32)"
 fi
 
-# Clean any stale lines from previous runs
+# Clean any stale lines from previous runs (defensive)
 sed -i '/^alt-tls-listening-port=/d' "${INSTALL_DIR}/turnserver.conf" 2>/dev/null || true
 sed -i '/^lt-cred-mech$/d'            "${INSTALL_DIR}/turnserver.conf" 2>/dev/null || true
 sed -i '/^listening-ip=/d'            "${INSTALL_DIR}/turnserver.conf" 2>/dev/null || true
+sed -i '/^no-ipv6$/d'                 "${INSTALL_DIR}/turnserver.conf" 2>/dev/null || true
 
 cat > "${INSTALL_DIR}/turnserver.conf" <<EOF
 # === coturn for Nextcloud Talk (shared-secret; multi-node ready) ===
@@ -132,6 +133,9 @@ use-auth-secret
 static-auth-secret=${SHARED_SECRET}
 stale-nonce
 fingerprint
+total-quota=0
+bps-capacity=0
+no-ipv6
 
 cert=/etc/letsencrypt/live/${DOMAIN}/fullchain.pem
 pkey=/etc/letsencrypt/live/${DOMAIN}/privkey.pem
@@ -227,7 +231,8 @@ PUBIP4="$(curl -4 -s https://api.ipify.org || true)"
 case "${1:-}" in
   creds)
     USER=$(($(date +%s)+3600))
-    PASS=$(printf "%s" "$USER" | openssl dgst -sha1 -mac HMAC -macopt hexkey:${SECRET} -binary | base64)
+    # IMPORTANT: use secret as literal string (no hex-decode)
+    PASS=$(printf "%s" "$USER" | openssl dgst -sha1 -mac HMAC -macopt key:${SECRET} -binary | base64)
     echo "Realm:     $REALM"
     echo "Username:  $USER"
     echo "Password:  $PASS" ;;
@@ -243,7 +248,8 @@ chmod +x /usr/local/bin/turnctl
 
 # ───────────────────────── 12) Final output ──────────────────────────────────
 USER_VAL=$(($(date +%s)+3600))
-PASS_VAL=$(printf "%s" "$USER_VAL" | openssl dgst -sha1 -mac HMAC -macopt hexkey:${SHARED_SECRET} -binary | base64)
+# IMPORTANT: use secret as literal string (no hex-decode)
+PASS_VAL=$(printf "%s" "$USER_VAL" | openssl dgst -sha1 -mac HMAC -macopt key:${SHARED_SECRET} -binary | base64)
 
 cat <<EOT
 
@@ -274,5 +280,6 @@ Watchtower schedule: ${WATCH_SCHED}  (TZ: ${TZ_STR})
 Notes:
   • If using Cloudflare, set each TURN A/AAAA record to DNS-only (grey cloud).
   • Cloud firewall must allow: 80/tcp, 443/tcp, 3478/udp+tcp, 5349/tcp, ${MINP}-${MAXP}/udp.
+  • IPv6 is disabled for coTURN (no-ipv6). If you later publish AAAA, re-enable here first.
 ===============================================================================
 EOT
